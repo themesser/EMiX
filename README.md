@@ -1,3 +1,5 @@
+<img width="2984" height="1702" alt="emix" src="https://github.com/user-attachments/assets/cd7f9846-e219-4b18-ab3f-a27495d99753" />
+
 # Installation
 
 EMix_reborn requires **Python 3.12**, Tkinter, and `python-rtmidi`.
