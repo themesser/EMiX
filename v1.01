@@ -1,0 +1,2755 @@
+#!/usr/bin/env python3
+"""
+EMX-1 Song Event Editor
+-----------------------
+Experimental editor for native Korg EMX-1 .EMX files.
+
+Current scope:
+- Reads the native 1,736,704-byte EMX-1 all-pattern/all-song file.
+- Lists the 64 song slots.
+- Reads song event data.
+- Edits mute/solo event masks (operation 0x01F7).
+- Edits/adds/deletes live note events (operation 0x4000).
+- Preserves all data outside the song table/event area.
+- Saves to a NEW .EMX file; the original is never modified.
+
+This is reverse-engineered from the EMX-1 file supplied for this project.
+Use "Save As" and test the resulting file on a backup of your EMX.
+"""
+
+import tkinter as tk
+import struct
+import re
+from tkinter import ttk, filedialog, messagebox
+from dataclasses import dataclass
+from pathlib import Path
+
+FILE_SIZE = 0x1A8000          # 1,736,704 bytes
+SONG_TABLE_BASE = 0x12FFF0   # 16-byte prefix immediately before 64 x 528-byte song records
+SONG_RECORD_SIZE = 528
+SONG_COUNT = 64
+EVENT_BASE = SONG_TABLE_BASE + 16 + SONG_COUNT * SONG_RECORD_SIZE
+MAX_EVENTS_PER_SONG = 20000
+
+OP_MUTE = 0x01F7
+OP_NOTE = 0x4000
+OP_TEMPO = 0x0203
+
+# Song automation opcodes confirmed from controlled EMX hardware/file tests.
+# 0x0007 was produced by recording Synth 1 FILTER CUTOFF in Song Event Record.
+# Native Song Event control decoding.
+# The lower 5 bits are the control id for Synth 1-5 blocks; the upper block
+# selects Synth 1..5. 0x0007 = Cutoff has been verified on the hardware.
+SYNTH_AUTOMATION_PARAMS = {
+    0x03: "OSC Edit 1",
+    0x04: "OSC Edit 2",
+    0x05: "Glide",
+    0x06: "Filter Type",
+    0x07: "Filter Cutoff",      # hardware verified
+    0x08: "Filter Resonance",
+    0x09: "Filter EG Int",
+    0x0A: "Filter Drive",
+    0x0B: "Level",
+    0x0C: "Pan",
+    0x0D: "EG Time",
+    0x0E: "Amp EG",
+    0x0F: "Roll",
+    0x10: "FX Send",
+    0x11: "FX Select",
+    0x12: "Mod Type",
+    0x13: "Mod Depth",
+    0x14: "Mod Speed",
+    0x15: "Mod Dest",
+    0x16: "Mod BPM Sync",
+    0x18: "Part Motion Seq",
+}
+
+# Drum controls use their own operation numbering. We can identify the drum
+# part block from the opcode, but keep the parameter hexadecimal until the
+# individual operation ids have been hardware-verified.
+
+SPECIAL_AUTOMATION_NAMES = {
+    0x1E0: "Accent Level",
+    0x1E1: "Accent Motion Seq",
+    0x1E4: "FX1 Type",
+    0x1E5: "FX1 Edit 1",
+    0x1E6: "FX1 Edit 2",
+    0x1E7: "FX1 Motion Seq",
+    0x1E8: "FX2 Type",
+    0x1E9: "FX2 Edit 1",
+    0x1EA: "FX2 Edit 2",
+    0x1EB: "FX2 Motion Seq",
+    0x1EC: "FX3 Type",
+    0x1ED: "FX3 Edit 1",
+    0x1EE: "FX3 Edit 2",
+    0x1EF: "FX3 Motion Seq",
+    0x1F5: "FX Chain",
+}
+
+DRUM_PART_LABELS = [
+    "Drum 1", "Drum 2", "Drum 3", "Drum 4", "Drum 5",
+    "Drum 6A", "Drum 6B", "Drum 7A", "Drum 7B",
+]
+
+DRUM_AUTOMATION_PARAMS = {
+    0x01: "Pitch",
+    0x07: "Level",
+    0x08: "Pan",
+    0x09: "EG Time",
+    0x0A: "Amp EG",
+    0x0B: "Roll",
+    0x0D: "FX Send",
+    0x0E: "FX Select",
+    0x0F: "Mod Type",
+    0x10: "Mod Depth",
+    0x11: "Mod Speed",
+    0x12: "Mod Dest",
+    0x13: "Mod BPM Sync",
+    0x14: "Part Motion Seq",
+}
+
+# EMX-1 note-event part numbering observed in the file.
+# 0-8 = nine drum parts, 9 = drum accent, 10-14 = five synth parts.
+PART_NAMES = [
+    "Drum 1", "Drum 2", "Drum 3", "Drum 4", "Drum 5",
+    "Drum 6A", "Drum 6B", "Drum 7A", "Drum 7B",
+    "Drum Accent",
+    "Synth 1", "Synth 2", "Synth 3", "Synth 4", "Synth 5",
+]
+
+# Song mute events do NOT include the two accent parts.
+# Native 14-bit order:
+# bits 0..8  = Drum 1,2,3,4,5,6A,6B,7A,7B
+# bits 9..13 = Synth 1,2,3,4,5
+MUTE_PART_NAMES = [
+    "Drum 1", "Drum 2", "Drum 3", "Drum 4", "Drum 5",
+    "Drum 6A", "Drum 6B", "Drum 7A", "Drum 7B",
+    "Synth 1", "Synth 2", "Synth 3", "Synth 4", "Synth 5",
+]
+
+# Timeline row -> native mute bit. Drum Accent (row 9) is not muteable.
+ROW_TO_MUTE_BIT = {
+    0:0, 1:1, 2:2, 3:3, 4:4, 5:5, 6:6, 7:7, 8:8,
+    10:9, 11:10, 12:11, 13:12, 14:13,
+}
+MUTE_BIT_TO_ROW = {bit: row for row, bit in ROW_TO_MUTE_BIT.items()}
+
+def pattern_name(value):
+    value = int(value) & 0xFF
+    return f'{"ABCD"[value // 64]}{(value % 64) + 1:02d}'
+
+
+@dataclass
+class Event:
+    raw: bytearray
+    source_index: int = 0
+
+    @property
+    def position(self): return self.raw[0]
+    @position.setter
+    def position(self, v): self.raw[0] = int(v) & 0xFF
+
+    @property
+    def measure(self): return self.raw[1] >> 4
+    @measure.setter
+    def measure(self, v): self.raw[1] = ((int(v) & 7) << 4) | (self.raw[1] & 0x0F)
+
+    @property
+    def step(self): return self.raw[1] & 0x0F
+    @step.setter
+    def step(self, v): self.raw[1] = (self.raw[1] & 0xF0) | (int(v) & 0x0F)
+
+    @property
+    def op(self): return int.from_bytes(self.raw[2:4], "big")
+
+    @property
+    def part(self): return self.raw[4]
+    @part.setter
+    def part(self, v): self.raw[4] = int(v) & 0xFF
+
+    @property
+    def note(self): return self.raw[5]
+    @note.setter
+    def note(self, v): self.raw[5] = int(v) & 0xFF
+
+    @property
+    def length(self): return int.from_bytes(self.raw[6:8], "big")
+    @length.setter
+    def length(self, v): self.raw[6:8] = int(v).to_bytes(2, "big")
+
+    @property
+    def mute_mask(self): return int.from_bytes(self.raw[6:8], "big")
+    @mute_mask.setter
+    def mute_mask(self, v): self.raw[6:8] = int(v & 0xFFFF).to_bytes(2, "big")
+
+    def clone(self):
+        return Event(bytearray(self.raw), self.source_index)
+
+class EMXFile:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = bytearray(self.path.read_bytes())
+        self.validate()
+        self.songs = []
+        self.parse()
+
+    def validate(self):
+        if len(self.data) != FILE_SIZE:
+            raise ValueError(f"Unexpected file size: {len(self.data):,} bytes; expected {FILE_SIZE:,}.")
+        if self.data[:12] != b"KORG\x00\x00\x00iEMX\x00":
+            raise ValueError("This does not look like a native Korg EMX-1 .EMX file.")
+        if self.data[SONG_TABLE_BASE+16:SONG_TABLE_BASE+16+8].strip(b"\x00 ") == b"":
+            raise ValueError("Could not locate the EMX-1 song table.")
+
+    def parse(self):
+        self.songs.clear()
+        cursor = EVENT_BASE
+        for i in range(SONG_COUNT):
+            off = SONG_TABLE_BASE + 16 + i * SONG_RECORD_SIZE
+            r = self.data[off:off+SONG_RECORD_SIZE]
+            name = bytes(r[:8]).decode("latin1", errors="replace").rstrip("\x00 ")
+            tempo = r[8] + r[9] / 10.0
+            length = r[11]
+            mute_hold = bool(r[12])
+            next_song = r[13]
+            count = int.from_bytes(r[14:16], "big")
+            patterns = list(r[16:272])
+            note_offsets = [x - 256 if x >= 128 else x for x in r[272:528]]
+
+            events = []
+            for j in range(count):
+                eoff = cursor + j * 8
+                events.append(Event(bytearray(self.data[eoff:eoff+8]), j))
+            cursor += count * 8
+
+            self.songs.append({
+                "index": i,
+                "offset": off,
+                "name": name,
+                "tempo": tempo,
+                "length": length,
+                "mute_hold": mute_hold,
+                "next_song": next_song,
+                "patterns": patterns,
+                "note_offsets": note_offsets,
+                "events": events,
+            })
+        self.event_end = cursor
+
+    def write(self, outpath):
+        out = bytearray(self.data)
+
+        # Rewrite only the 64 song records, keeping the 16-byte prefix intact.
+        for s in self.songs:
+            off = s["offset"]
+            r = bytearray(out[off:off+SONG_RECORD_SIZE])
+
+            name = s["name"].encode("latin1", errors="replace")[:8].ljust(8, b"\x00")
+            r[:8] = name
+            tempo = max(20.0, min(300.0, float(s["tempo"])))
+            whole = int(tempo)
+            frac = int(round((tempo - whole) * 10))
+            if frac == 10:
+                whole += 1
+                frac = 0
+            r[8] = whole & 0xFF
+            r[9] = frac & 0xFF
+            r[11] = int(s["length"]) & 0xFF
+            r[12] = 1 if s["mute_hold"] else 0
+            r[13] = int(s["next_song"]) & 0xFF
+            r[14:16] = len(s["events"]).to_bytes(2, "big")
+
+            for j, p in enumerate(s["patterns"][:256]):
+                r[16+j] = int(p) & 0xFF
+            for j, n in enumerate(s["note_offsets"][:256]):
+                r[272+j] = int(n) & 0xFF
+
+            out[off:off+SONG_RECORD_SIZE] = r
+
+        # Rebuild contiguous song-event data.
+        pos = EVENT_BASE
+        for s in self.songs:
+            if len(s["events"]) > MAX_EVENTS_PER_SONG:
+                raise ValueError(f"Song {s['index']+1} has too many events.")
+            for e in s["events"]:
+                out[pos:pos+8] = e.raw
+                pos += 8
+
+        # Clear the unused tail of the song-event area up to the old event end
+        # only if it is inside the area occupied by the old song-event data.
+        # Do not touch anything after self.event_end.
+        old_end = self.event_end
+        if pos < old_end:
+            out[pos:old_end] = b"\x00" * (old_end - pos)
+
+        Path(outpath).write_bytes(out)
+
+def midi_note_name(n):
+    names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    octave = n // 12 - 1
+    return f"{names[n % 12]}{octave}"
+
+def position_text(e):
+    return f"P{e.position+1:03d}  M{e.measure+1}  S{e.step+1:02d}"
+
+
+class App(tk.Tk):
+    PATTERN_H = 26
+    # Timeline units:
+    # event byte 0 = song pattern position (0..255)
+    # event byte 1 = event clock within that pattern (0..127 observed).
+    # We deliberately call byte 1 "clock" rather than "step": the file contains
+    # values beyond the 16 step buttons, so treating it as a 16-step number loses
+    # information.
+    TICKS_PER_POSITION = 128
+    ROW_H = 28
+    LEFT_W = 105
+
+    def __init__(self):
+        super().__init__()
+        self.title("EMiX reborn")
+        self.geometry("1500x860")
+        self.minsize(1100, 650)
+
+        self.emx = None
+        self.open_emx_files = []          # [{"emx": EMXFile, "path": str, "label": str}, ...]
+        self.active_emx_index = None
+        self.song_clipboard = None
+        self.current_song = None
+        self.current_event = None
+        self.current_event_index = None
+        self.selected_event_indices = set()
+        self.drag_select_start = None
+        self.drag_select_rect = None
+        self.play_tick = 0
+        self.selected_pattern_pos = None
+        self.undo_stack = []
+        self.show_notes = tk.BooleanVar(value=True)
+        self.show_mutes = tk.BooleanVar(value=True)
+        self.show_automation = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar(value="Open an EMX file.")
+        self.zoom = tk.DoubleVar(value=1.0)
+
+        # Timeline performance caches.  Layout/grouping only changes when the
+        # event list itself changes (song switch, add/delete/undo), not while
+        # an existing event is dragged.
+        self._timeline_cache = None
+        self._redraw_after = None
+        self._zoom_after = None
+        self._pending_zoom_anchor = None
+        self._timeline_viewport_width = 900
+        self._visual_pxt = None
+        self._loading_event_fields = False
+        self._auto_commit_after = None
+
+        self._build_ui()
+        self.bind_all("<Command-z>", lambda e: self.undo())
+        self.bind_all("<Command-Z>", lambda e: self.undo())
+        self.bind_all("<Control-z>", lambda e: self.undo())
+        self.bind_all("<Control-Z>", lambda e: self.undo())
+
+    def _build_ui(self):
+        top = ttk.Frame(self, padding=7)
+        top.pack(fill="x")
+
+        ttk.Button(top, text="Open .EMX", command=self.open_file).pack(side="left")
+
+        self.emx_file_var = tk.StringVar()
+        self.emx_file_combo = ttk.Combobox(
+            top, textvariable=self.emx_file_var,
+            state="readonly", width=22
+        )
+        self.emx_file_combo.pack(side="left", padx=(4, 4))
+        self.emx_file_combo.bind("<<ComboboxSelected>>", self.active_emx_changed)
+
+        ttk.Button(top, text="Save As…", command=self.save_as).pack(side="left", padx=4)
+        ttk.Button(top, text="↶ Undo", command=self.undo).pack(side="left", padx=4)
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=7)
+
+        ttk.Button(top, text="Copy Song", command=self.copy_current_song).pack(side="left", padx=2)
+        ttk.Button(top, text="Paste Song", command=self.paste_song).pack(side="left", padx=2)
+        ttk.Button(
+            top, text="Send selected song to EMX",
+            command=self.send_selected_song_to_emx
+        ).pack(side="left", padx=4)
+
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=7)
+        ttk.Button(
+            top, text="Import MIDI structure from markers",
+            command=self.import_logic_midi_structure
+        ).pack(side="left", padx=4)
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=7)
+
+        ttk.Label(top, textvariable=self.status_var).pack(side="right")
+
+        body = ttk.Panedwindow(self, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=7, pady=(0, 7))
+
+        left = ttk.Frame(body, padding=5)
+        center = ttk.Frame(body, padding=5)
+        right = ttk.Frame(body, padding=5)
+        body.add(left, weight=1)
+        body.add(center, weight=12)
+        body.add(right, weight=1)
+
+        # SONG LIST
+        ttk.Label(left, text="SONGS").pack(anchor="w")
+        self.song_tree = ttk.Treeview(
+            left, columns=("name","events","len"), show="headings", height=30
+        )
+        for c, h, w in [("name","Name",115),("events","Events",58),("len","Pos",45)]:
+            self.song_tree.heading(c, text=h)
+            self.song_tree.column(c, width=w, anchor="e" if c != "name" else "w")
+        self.song_tree.pack(fill="both", expand=True)
+        self.song_tree.bind("<<TreeviewSelect>>", self.song_selected)
+        self.song_tree.bind("<Double-1>", self.edit_song_name)
+
+        # TIMELINE HEADER
+        hdr = ttk.Frame(center)
+        hdr.pack(fill="x")
+        self.song_title = ttk.Label(hdr, text="No song selected", font=("", 13, "bold"))
+        self.song_title.pack(side="left")
+        self.swap_synth_btn = ttk.Button(
+            hdr, text="Swap selected tracks",
+            command=self.swap_selected_tracks,
+            state="disabled"
+        )
+        self.swap_synth_btn.pack(side="left", padx=(10, 0))
+        ttk.Label(hdr, text="  Zoom").pack(side="left", padx=(15, 3))
+        ttk.Scale(hdr, from_=0.0, to=12.0, variable=self.zoom,
+                  command=self.slider_zoom).pack(side="left", fill="x", expand=False, padx=3)
+        ttk.Checkbutton(
+            hdr, text="Notes", variable=self.show_notes,
+            command=self.draw_timeline
+        ).pack(side="right")
+        ttk.Checkbutton(
+            hdr, text="Mute events", variable=self.show_mutes,
+            command=self.draw_timeline
+        ).pack(side="right", padx=8)
+        ttk.Checkbutton(
+            hdr, text="Automation", variable=self.show_automation,
+            command=self.toggle_automation_visibility
+        ).pack(side="right", padx=8)
+
+        # Timeline canvas. The event area scrolls horizontally while the
+        # part labels stay fixed on the left.
+        frame = ttk.Frame(center)
+        frame.pack(fill="both", expand=True, pady=5)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+
+        self.label_canvas = tk.Canvas(
+            frame, width=self.LEFT_W, background="#171717",
+            highlightthickness=0
+        )
+        self.canvas = tk.Canvas(
+            frame, background="#171717", highlightthickness=0
+        )
+
+        self.vbar = ttk.Scrollbar(frame, orient="vertical")
+        self.hbar = ttk.Scrollbar(frame, orient="horizontal")
+
+        self.canvas.configure(xscrollcommand=self.hbar.set)
+        self.vbar.configure(command=self._vertical_scroll)
+        self.hbar.configure(command=self.canvas.xview)
+
+        self.label_canvas.grid(row=0, column=0, sticky="ns")
+        self.canvas.grid(row=0, column=1, sticky="nsew")
+        self.vbar.grid(row=0, column=2, sticky="ns")
+        self.hbar.grid(row=1, column=1, sticky="ew")
+
+        self.canvas.bind("<Control-Button-1>", self.canvas_ctrl_click)
+        self.canvas.bind("<Shift-Button-1>", self.canvas_shift_click)
+
+        # Cmd+drag on an existing note = vertical-only track move.
+        # Tk on macOS recognizes Command directly; Mod2 is kept as a fallback.
+        self.canvas.bind("<Command-Button-1>", self.canvas_cmd_note_drag)
+        self.canvas.bind("<Mod2-Button-1>", self.canvas_cmd_note_drag)
+
+        # macOS may expose Control-click as a secondary button event.
+        self.canvas.bind("<Control-Button-2>", self.canvas_ctrl_click)
+        self.canvas.bind("<Button-1>", self.canvas_click)
+        self.canvas.bind("<B1-Motion>", self.canvas_drag_select)
+        self.canvas.bind("<ButtonRelease-1>", self.canvas_release_select)
+        self.canvas.bind("<Double-1>", self.canvas_double_click)
+        self.canvas.bind("<Delete>", lambda e: self.delete_selected_events())
+        self.canvas.bind("<BackSpace>", lambda e: self.delete_selected_events())
+        self.canvas.bind("<Configure>", self.timeline_configure)
+        # V8-style direct canvas wheel binding. This was the reliable path
+        # on macOS before the later global-wheel experiments.
+        self.canvas.bind("<MouseWheel>", self.timeline_wheel_zoom)
+        self.canvas.bind("<Button-4>", lambda e: self.timeline_wheel_zoom_linux(e, 1))
+        self.canvas.bind("<Button-5>", lambda e: self.timeline_wheel_zoom_linux(e, -1))
+        self.canvas.configure(takefocus=True)
+        self.group_drag = None
+        self.selected_swap_tracks = set()
+        self.label_canvas.bind("<Button-1>", self.label_canvas_click)
+        self.label_canvas.bind("<Configure>", lambda e: self.draw_timeline())
+
+        # RIGHT SIDE
+        event_box = ttk.Frame(right, padding=2)
+        event_box.pack(fill="x")
+        self.info = ttk.Label(event_box, text="Click an event in the timeline.")
+        self.info.pack(anchor="w", pady=(0, 7))
+
+        self.vars = {k: tk.StringVar() for k in
+                     ["position","clock","part","note","length","mask"]}
+        form = ttk.Frame(event_box)
+        form.pack(fill="x")
+        fields = [
+            ("position", "Pattern position"),
+            ("clock", "Step (0–127)"),
+            ("note", "MIDI note"),
+            ("length", "Gate length"),
+            ("mask", "Mute mask (hex)"),
+        ]
+        for r, (key, label) in enumerate(fields):
+            ttk.Label(form, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Entry(form, textvariable=self.vars[key], width=9).grid(
+                row=r, column=1, sticky="ew", pady=2
+            )
+        form.columnconfigure(1, weight=1)
+
+        # Auto-commit event-field edits shortly after typing/selecting a value.
+        for _var in self.vars.values():
+            _var.trace_add("write", self._schedule_event_auto_commit)
+
+        ttk.Label(
+            right,
+            text=(
+                "EMiX reborn is a tool to manipulate songs (and soon patterns) on the KORG EMX1.\n"
+                "https://github.com/themesser/EMiX\n\n"
+                "Ctrl + click = add mute event\n"
+                "Shift + Click = add note event\n"
+                "Cmd + drag = move notes vertically only\n"
+                "Select 2 tracks to swap\n\n"
+                "If your EMX is connected to your computer via MIDI, you can send the current song "
+                "to the current song slot selected on the EMX using \"Send selected song to EMX\"\n\n"
+                "Import MIDI structure is experimental and not yet tested properly"
+            ),
+            justify="left",
+            wraplength=220
+        ).pack(anchor="w", padx=4, pady=(6, 0))
+
+
+
+
+    # ---------- file / songs ----------
+    def _emx_display_label(self, path):
+        base = Path(path).name
+        existing = {d["label"] for d in self.open_emx_files}
+        if base not in existing:
+            return base
+        stem = Path(path).stem
+        suffix = Path(path).suffix
+        n = 2
+        while f"{stem} ({n}){suffix}" in existing:
+            n += 1
+        return f"{stem} ({n}){suffix}"
+
+    def _refresh_emx_file_combo(self):
+        labels = [d["label"] for d in self.open_emx_files]
+        self.emx_file_combo["values"] = labels
+        if self.active_emx_index is not None and 0 <= self.active_emx_index < len(labels):
+            self.emx_file_combo.current(self.active_emx_index)
+
+    def _populate_song_tree(self):
+        self.song_tree.delete(*self.song_tree.get_children())
+        if not self.emx:
+            return
+
+        for s in self.emx.songs:
+            empty = not (s["name"] or s["events"] or s["length"])
+            display_name = s["name"] or (
+                f"Song {s['index']+1:02d}  (empty)" if empty
+                else f"Song {s['index']+1:02d}"
+            )
+            self.song_tree.insert(
+                "", "end", iid=str(s["index"]),
+                values=(display_name, len(s["events"]), s["length"])
+            )
+
+    def _activate_emx_index(self, index, select_song_index=0):
+        if not (0 <= index < len(self.open_emx_files)):
+            return
+
+        self.active_emx_index = index
+        doc = self.open_emx_files[index]
+        self.emx = doc["emx"]
+        self.file_label = doc["path"]
+
+        # Undo snapshots are song-specific; avoid applying a previous file's
+        # undo history to the newly selected project.
+        self.undo_stack.clear()
+
+        self.current_song = None
+        self.current_event = None
+        self.current_event_index = None
+        self.selected_event_indices.clear()
+        self.selected_pattern_pos = None
+        self.play_tick = 0
+        self.invalidate_timeline_cache()
+
+        self._refresh_emx_file_combo()
+        self._populate_song_tree()
+
+        children = self.song_tree.get_children()
+        if children:
+            iid = str(max(0, min(SONG_COUNT - 1, int(select_song_index))))
+            if iid not in children:
+                iid = children[0]
+            self.song_tree.selection_set(iid)
+            self.song_tree.see(iid)
+            self.song_selected()
+
+        self.status_var.set(
+            f"Active file: {doc['label']}  •  {len(self.emx.data):,} bytes"
+        )
+
+    def active_emx_changed(self, event=None):
+        index = self.emx_file_combo.current()
+        if index >= 0 and index != self.active_emx_index:
+            self._activate_emx_index(index)
+
+    def open_file(self):
+        p = filedialog.askopenfilename(
+            filetypes=[("Korg EMX files","*.EMX *.emx"),("All files","*.*")]
+        )
+        if not p:
+            return
+
+        resolved = str(Path(p).resolve())
+
+        # If already open, just switch to it.
+        for i, doc in enumerate(self.open_emx_files):
+            try:
+                same = str(Path(doc["path"]).resolve()) == resolved
+            except Exception:
+                same = doc["path"] == p
+            if same:
+                self._activate_emx_index(i)
+                return
+
+        try:
+            emx = EMXFile(p)
+        except Exception as e:
+            messagebox.showerror("Cannot open", str(e))
+            return
+
+        self.open_emx_files.append({
+            "emx": emx,
+            "path": p,
+            "label": self._emx_display_label(p),
+        })
+        self._activate_emx_index(len(self.open_emx_files) - 1)
+
+
+    def _clone_song_payload(self, song):
+        """Deep-copy all editable song data, excluding destination slot identity."""
+        return {
+            "name": str(song["name"]),
+            "tempo": float(song["tempo"]),
+            "length": int(song["length"]),
+            "mute_hold": bool(song["mute_hold"]),
+            "next_song": int(song["next_song"]),
+            "patterns": list(song["patterns"]),
+            "note_offsets": list(song["note_offsets"]),
+            "events": [e.clone() for e in song["events"]],
+        }
+
+    def copy_current_song(self):
+        if not self.current_song or self.active_emx_index is None:
+            self.status_var.set("Select a song to copy.")
+            return
+
+        doc = self.open_emx_files[self.active_emx_index]
+        self.song_clipboard = {
+            "payload": self._clone_song_payload(self.current_song),
+            "source_file": doc["label"],
+            "source_slot": int(self.current_song["index"]),
+        }
+
+        name = self.current_song["name"] or f"Song {self.current_song['index']+1:02d}"
+        self.status_var.set(
+            f"Copied {name} from {doc['label']} • "
+            f"{len(self.current_song['events'])} events"
+        )
+
+    def paste_song(self):
+        if self.song_clipboard is None:
+            messagebox.showinfo("Paste Song", "Copy a song first.")
+            return
+        if not self.current_song or self.active_emx_index is None:
+            messagebox.showinfo("Paste Song", "Select a destination song slot first.")
+            return
+
+        payload = self.song_clipboard["payload"]
+        dest = self.current_song
+        dest_slot = int(dest["index"])
+
+        dest_label = self.open_emx_files[self.active_emx_index]["label"]
+        src_label = self.song_clipboard["source_file"]
+        src_slot = self.song_clipboard["source_slot"] + 1
+
+        src_name = payload["name"] or f"Song {src_slot:02d}"
+        dest_name = dest["name"] or f"Song {dest_slot+1:02d}"
+
+        if not messagebox.askyesno(
+            "Paste Song",
+            f"Replace {dest_name} in {dest_label} with:\n\n"
+            f"{src_name} from {src_label}?\n\n"
+            "This copies the complete song structure and all song events."
+        ):
+            return
+
+        # One undo step restores the destination song.
+        self.push_undo()
+
+        # Preserve destination-only identity fields: index + native record offset.
+        dest["name"] = payload["name"]
+        dest["tempo"] = payload["tempo"]
+        dest["length"] = payload["length"]
+        dest["mute_hold"] = payload["mute_hold"]
+        dest["next_song"] = payload["next_song"]
+        dest["patterns"] = list(payload["patterns"])
+        dest["note_offsets"] = list(payload["note_offsets"])
+        dest["events"] = [
+            Event(bytearray(e.raw), i)
+            for i, e in enumerate(payload["events"])
+        ]
+
+        self.invalidate_timeline_cache()
+        self.current_event = None
+        self.current_event_index = None
+        self.selected_event_indices.clear()
+        self.selected_pattern_pos = None
+        self.play_tick = 0
+        self.dirty = True
+
+        self._populate_song_tree()
+        iid = str(dest_slot)
+        self.song_tree.selection_set(iid)
+        self.song_tree.see(iid)
+        self.song_selected()
+
+        self.status_var.set(
+            f"Pasted {src_name} into {dest_label} / Song {dest_slot+1:02d}"
+        )
+
+    def edit_song_name(self, event):
+        row=self.song_tree.identify_row(event.y)
+        col=self.song_tree.identify_column(event.x)
+        if not row or col!="#1" or not self.emx:return
+        bbox=self.song_tree.bbox(row,"name")
+        if not bbox:return
+        x,y,w,h=bbox
+        old=self.emx.songs[int(row)]["name"]
+        entry=ttk.Entry(self.song_tree)
+        entry.insert(0,old);entry.select_range(0,"end")
+        entry.place(x=x,y=y,width=w,height=h);entry.focus_set()
+        def commit(_=None):
+            name=entry.get()[:8]
+            self.emx.songs[int(row)]["name"]=name
+            vals=list(self.song_tree.item(row,"values"))
+            s=self.emx.songs[int(row)]
+            empty=not (s["name"] or s["events"] or s["length"])
+            vals[0]=name or (
+                f"Song {int(row)+1:02d}  (empty)" if empty
+                else f"Song {int(row)+1:02d}"
+            )
+            self.song_tree.item(row,values=vals)
+            if self.current_song is self.emx.songs[int(row)]:
+                self.song_title.config(text=name or f"Song {int(row)+1}")
+            self.dirty=True;entry.destroy()
+        entry.bind("<Return>",commit);entry.bind("<FocusOut>",commit)
+        entry.bind("<Escape>",lambda e:entry.destroy())
+
+    def song_selected(self, event=None):
+        if not self.emx:
+            return
+        sel = self.song_tree.selection()
+        if not sel:
+            return
+        self.current_song = self.emx.songs[int(sel[0])]
+        self.selected_swap_tracks.clear()
+        self.swap_synth_btn.state(["disabled"])
+        self.invalidate_timeline_cache()
+        self.current_event = None
+        self.current_event_index = None
+        self.selected_event_indices.clear()
+        self.play_tick = 0
+        self.selected_pattern_pos = None
+        self.song_title.config(
+            text=f"Song {self.current_song['index']+1:02d}  •  "
+                 f"{self.current_song['name'] or '(unnamed)'}"
+        )
+        self.draw_timeline()
+
+    @staticmethod
+    def _midi_read_vlq(data, pos):
+        value = 0
+        for _ in range(4):
+            if pos >= len(data):
+                raise ValueError("Unexpected end of MIDI file.")
+            b = data[pos]
+            pos += 1
+            value = (value << 7) | (b & 0x7F)
+            if not (b & 0x80):
+                return value, pos
+        raise ValueError("Invalid MIDI variable-length value.")
+
+    @classmethod
+    def _midi_marker_events(cls, path):
+        """Return [(absolute_tick, text), ...] for SMF Marker meta events (FF 06)."""
+        data = Path(path).read_bytes()
+        if len(data) < 14 or data[:4] != b"MThd":
+            raise ValueError("This is not a Standard MIDI file.")
+
+        header_len = int.from_bytes(data[4:8], "big")
+        if header_len < 6 or 8 + header_len > len(data):
+            raise ValueError("Invalid MIDI header.")
+
+        ntrks = int.from_bytes(data[10:12], "big")
+        pos = 8 + header_len
+        markers = []
+
+        for _track_index in range(ntrks):
+            if pos + 8 > len(data) or data[pos:pos+4] != b"MTrk":
+                raise ValueError("Invalid MIDI track chunk.")
+            length = int.from_bytes(data[pos+4:pos+8], "big")
+            start = pos + 8
+            end = start + length
+            if end > len(data):
+                raise ValueError("Truncated MIDI track.")
+            pos = end
+
+            p = start
+            absolute_tick = 0
+            running_status = None
+
+            while p < end:
+                delta, p = cls._midi_read_vlq(data, p)
+                absolute_tick += delta
+                if p >= end:
+                    break
+
+                status = data[p]
+
+                if status < 0x80:
+                    if running_status is None:
+                        raise ValueError("Invalid MIDI running status.")
+                    status = running_status
+                else:
+                    p += 1
+                    if status < 0xF0:
+                        running_status = status
+                    else:
+                        running_status = None
+
+                if status == 0xFF:
+                    if p >= end:
+                        break
+                    meta_type = data[p]
+                    p += 1
+                    size, p = cls._midi_read_vlq(data, p)
+                    payload = data[p:p+size]
+                    p += size
+                    if meta_type == 0x06:  # Marker
+                        text = payload.decode("utf-8", errors="replace").strip()
+                        markers.append((absolute_tick, text))
+                    if meta_type == 0x2F:  # End of Track
+                        break
+                    continue
+
+                if status in (0xF0, 0xF7):
+                    size, p = cls._midi_read_vlq(data, p)
+                    p += size
+                    continue
+
+                hi = status & 0xF0
+                data_len = 1 if hi in (0xC0, 0xD0) else 2
+
+                # With running status the first data byte is still at p.
+                p += data_len
+
+        markers.sort(key=lambda item: item[0])
+        return markers
+
+    @staticmethod
+    def _pattern_code_from_marker(text):
+        """
+        Accept markers such as:
+          A01
+          A01 Verse
+          A01 - Verse
+          B12_CHORUS
+        The leading A01-D64 token is the only imported information.
+        """
+        m = re.match(r"^\s*([A-Da-d])\s*0?([1-9]|[1-5][0-9]|6[0-4])(?:\b|[_\-\s])", text)
+        if not m:
+            # Also accept an exact token like A01 without needing a separator.
+            m = re.match(r"^\s*([A-Da-d])0([1-9])\s*$", text)
+        if not m:
+            return None
+
+        bank = m.group(1).upper()
+        number = int(m.group(2))
+        if not 1 <= number <= 64:
+            return None
+        value = "ABCD".index(bank) * 64 + (number - 1)
+        return value, f"{bank}{number:02d}"
+
+    @staticmethod
+    def _korg_pack_song_payload(data):
+        src = bytes(data)
+        out = bytearray()
+        for start in range(0, len(src), 7):
+            group = src[start:start+7]
+            msb = 0
+            for bit, b in enumerate(group):
+                if b & 0x80:
+                    msb |= (1 << bit)
+            out.append(msb)
+            out.extend(b & 0x7F for b in group)
+        return bytes(out)
+
+    def _current_song_native_payload(self):
+        """Build exactly the native Current Song payload from the selected song."""
+        if not self.current_song:
+            raise ValueError("No song selected.")
+
+        s = self.current_song
+        record = bytearray(SONG_RECORD_SIZE)
+
+        record[:8] = (
+            s["name"].encode("latin1", errors="replace")[:8].ljust(8, b" ")
+        )
+
+        tempo_i = int(s["tempo"])
+        tempo_d = int(round((s["tempo"] - tempo_i) * 10))
+        record[8] = tempo_i & 0xFF
+        record[9] = tempo_d & 0xFF
+        # preserve byte 10 from original record when possible
+        try:
+            source = self.emx.data[s["offset"]:s["offset"] + SONG_RECORD_SIZE]
+            record[10] = source[10]
+        except Exception:
+            record[10] = 0
+
+        record[11] = int(s["length"]) & 0xFF
+        record[12] = 1 if s["mute_hold"] else 0
+        record[13] = int(s["next_song"]) & 0xFF
+        record[14:16] = len(s["events"]).to_bytes(2, "big")
+        record[16:272] = bytes(s["patterns"][:256])
+        record[272:528] = bytes((x & 0xFF) for x in s["note_offsets"][:256])
+
+        events = b"".join(bytes(e.raw) for e in s["events"])
+        return bytes(record) + events
+
+    def send_selected_song_to_emx(self):
+        if not self.current_song:
+            messagebox.showinfo("Send to EMX", "Select a song first.")
+            return
+
+        try:
+            import rtmidi
+        except ImportError:
+            messagebox.showerror(
+                "MIDI dependency missing",
+                "python-rtmidi is not installed in the Python environment running this editor.\n\n"
+                "Install it in your virtual environment with:\n"
+                "python -m pip install python-rtmidi"
+            )
+            return
+
+        try:
+            payload = self._current_song_native_payload()
+            packed = self._korg_pack_song_payload(payload)
+        except Exception as exc:
+            messagebox.showerror("Send to EMX", str(exc))
+            return
+
+        # Simple modal MIDI setup dialog.
+        dialog = tk.Toplevel(self)
+        dialog.title("Send selected song to EMX")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        outer = ttk.Frame(dialog, padding=10)
+        outer.pack(fill="both", expand=True)
+
+        midi_out = rtmidi.MidiOut()
+        midi_in = rtmidi.MidiIn()
+        out_ports = midi_out.get_ports()
+        in_ports = midi_in.get_ports()
+
+        if not out_ports or not in_ports:
+            dialog.destroy()
+            messagebox.showerror(
+                "MIDI ports",
+                "No MIDI input/output ports are available.\n"
+                "Connect and power on your MIDI interface first."
+            )
+            return
+
+        ttk.Label(outer, text="MIDI OUT → EMX MIDI IN").grid(row=0, column=0, sticky="w")
+        out_var = tk.StringVar(value=out_ports[0])
+        out_combo = ttk.Combobox(
+            outer, textvariable=out_var, values=out_ports,
+            state="readonly", width=42
+        )
+        out_combo.grid(row=1, column=0, sticky="ew", pady=(2, 8))
+
+        ttk.Label(outer, text="MIDI IN ← EMX MIDI OUT").grid(row=2, column=0, sticky="w")
+        in_var = tk.StringVar(value=in_ports[0])
+        in_combo = ttk.Combobox(
+            outer, textvariable=in_var, values=in_ports,
+            state="readonly", width=42
+        )
+        in_combo.grid(row=3, column=0, sticky="ew", pady=(2, 8))
+
+        ttk.Label(outer, text="EMX global MIDI channel").grid(row=4, column=0, sticky="w")
+        channel_var = tk.IntVar(value=1)
+        channel_combo = ttk.Combobox(
+            outer, textvariable=channel_var,
+            values=list(range(1, 17)),
+            state="readonly", width=6
+        )
+        channel_combo.grid(row=5, column=0, sticky="w", pady=(2, 8))
+
+        song_name = self.current_song["name"] or f"Song {self.current_song['index']+1:02d}"
+        ttk.Label(
+            outer,
+            text=(
+                f"{song_name} • {len(self.current_song['events'])} events • "
+                f"{len(payload):,} native bytes\n"
+                "This loads the song into the EMX edit buffer only.\n"
+                "No WRITE command will be sent."
+            ),
+            justify="left"
+        ).grid(row=6, column=0, sticky="w", pady=(0, 8))
+
+        status = tk.StringVar(value="")
+        ttk.Label(outer, textvariable=status).grid(row=7, column=0, sticky="w", pady=(0, 8))
+
+        buttons = ttk.Frame(outer)
+        buttons.grid(row=8, column=0, sticky="e")
+
+        def do_send():
+            try:
+                out_index = out_ports.index(out_var.get())
+                in_index = in_ports.index(in_var.get())
+                channel = int(channel_var.get())
+            except Exception:
+                status.set("Choose valid MIDI ports/channel.")
+                return
+
+            device_byte = 0x30 + (channel - 1)
+            sysex = bytes([
+                0xF0, 0x42, device_byte, 0x69, 0x58
+            ]) + packed + bytes([0xF7])
+
+            try:
+                midi_in.ignore_types(sysex=False, timing=True, active_sense=True)
+            except TypeError:
+                midi_in.ignore_types(False, True, True)
+
+            try:
+                midi_in.open_port(in_index)
+                midi_out.open_port(out_index)
+
+                # flush stale input
+                import time
+                until = time.monotonic() + 0.15
+                while time.monotonic() < until:
+                    if midi_in.get_message() is None:
+                        time.sleep(0.002)
+
+                status.set(f"Sending {len(sysex):,} SysEx bytes…")
+                dialog.update_idletasks()
+
+                midi_out.send_message(list(sysex))
+
+                deadline = time.monotonic() + 5.0
+                got_complete = False
+                got_error = False
+
+                while time.monotonic() < deadline:
+                    result = midi_in.get_message()
+                    if result is None:
+                        time.sleep(0.002)
+                        continue
+                    message, _delta = result
+                    if not message:
+                        continue
+                    raw = bytes(message)
+                    if (
+                        len(raw) >= 6
+                        and raw[0] == 0xF0
+                        and raw[1] == 0x42
+                        and raw[3] == 0x69
+                    ):
+                        func = raw[4]
+                        if func == 0x23:
+                            got_complete = True
+                            break
+                        if func == 0x24:
+                            got_error = True
+                            break
+
+                if got_complete:
+                    status.set("EMX: Data Load Completed.")
+                    self.status_var.set(
+                        f"Sent {song_name} to EMX edit buffer"
+                    )
+                elif got_error:
+                    status.set("EMX: Data Load Error.")
+                else:
+                    status.set(
+                        "Song sent. No acknowledgement received; "
+                        "check the EMX edit buffer."
+                    )
+
+            except Exception as exc:
+                status.set(f"MIDI error: {exc}")
+
+            finally:
+                try:
+                    if midi_in.is_port_open():
+                        midi_in.close_port()
+                except Exception:
+                    pass
+                try:
+                    if midi_out.is_port_open():
+                        midi_out.close_port()
+                except Exception:
+                    pass
+
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(buttons, text="Send to edit buffer", command=do_send).pack(side="right", padx=(0, 6))
+
+    def import_logic_midi_structure(self):
+        if not self.current_song:
+            messagebox.showinfo(
+                "Logic MIDI structure",
+                "Open an EMX file and select the destination song first."
+            )
+            return
+
+        path = filedialog.askopenfilename(
+            title="Import Logic MIDI structure",
+            filetypes=[
+                ("Standard MIDI files", "*.mid *.midi"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        try:
+            markers = self._midi_marker_events(path)
+        except Exception as exc:
+            messagebox.showerror("MIDI import", str(exc))
+            return
+
+        sequence = []
+        ignored = []
+        seen_ticks = set()
+
+        for tick, text in markers:
+            decoded = self._pattern_code_from_marker(text)
+            if decoded is None:
+                ignored.append(text or "(unnamed marker)")
+                continue
+
+            # "Create Markers From Regions" can occasionally yield stacked
+            # markers at the same position. One EMX song position can contain
+            # only one pattern, so keep the first valid pattern marker there.
+            if tick in seen_ticks:
+                continue
+            seen_ticks.add(tick)
+
+            value, code = decoded
+            sequence.append((tick, value, code, text))
+
+        if not sequence:
+            messagebox.showerror(
+                "Logic MIDI structure",
+                "No A01-D64 markers were found.\n\n"
+                "In Logic Pro, create markers from the MIDI regions/loop copies "
+                "and name those markers A01-D64 before exporting the MIDI file."
+            )
+            return
+
+        if len(sequence) > 256:
+            messagebox.showerror(
+                "Logic MIDI structure",
+                f"The MIDI contains {len(sequence)} pattern markers. "
+                "An EMX song supports at most 256 song positions."
+            )
+            return
+
+        old_codes = [
+            pattern_name(self.current_song["patterns"][i])
+            for i in range(min(int(self.current_song.get("length", 0)), 256))
+        ]
+        new_codes = [item[2] for item in sequence]
+
+        preview_count = min(24, len(new_codes))
+        preview = "  ".join(new_codes[:preview_count])
+        if len(new_codes) > preview_count:
+            preview += "  …"
+
+        target_name = self.current_song["name"] or f"Song {self.current_song['index']+1}"
+        answer = messagebox.askyesno(
+            "Import Logic MIDI structure",
+            f"Import {len(new_codes)} song positions into {target_name}?\n\n"
+            f"{preview}\n\n"
+            "Only the EMX pattern sequence and song length will be replaced.\n"
+            "Existing EMX note, mute and automation events will remain unchanged."
+        )
+        if not answer:
+            return
+
+        patterns = self.current_song["patterns"]
+        for i, (_tick, value, _code, _text) in enumerate(sequence):
+            patterns[i] = value
+        self.current_song["length"] = len(sequence)
+
+        self.selected_pattern_pos = None
+        self.play_tick = 0
+        self.dirty = True
+        self.draw_timeline()
+
+        # Refresh song list length column without rebuilding the whole list.
+        iid = str(self.current_song["index"])
+        if self.song_tree.exists(iid):
+            vals = list(self.song_tree.item(iid, "values"))
+            if len(vals) >= 3:
+                vals[2] = len(sequence)
+                self.song_tree.item(iid, values=vals)
+
+        ignored_msg = (
+            f" • {len(ignored)} non-pattern marker(s) ignored"
+            if ignored else ""
+        )
+        self.status_var.set(
+            f"Imported Logic structure: {len(sequence)} positions{ignored_msg}"
+        )
+
+    def save_as(self):
+        if not self.emx:
+            return
+        p = filedialog.asksaveasfilename(
+            defaultextension=".EMX",
+            filetypes=[("Korg EMX files","*.EMX"),("All files","*.*")]
+        )
+        if not p:
+            return
+        try:
+            self.emx.write(p)
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+            return
+
+        # Re-open the just-written file as the active document base so future
+        # Save As operations are based on the latest event-area layout.
+        try:
+            refreshed = EMXFile(p)
+        except Exception as e:
+            messagebox.showerror(
+                "Saved but reload failed",
+                f"The file was saved, but could not be reloaded:\n{e}"
+            )
+            return
+
+        if self.active_emx_index is not None:
+            self.open_emx_files[self.active_emx_index] = {
+                "emx": refreshed,
+                "path": p,
+                "label": Path(p).name,
+            }
+            current_slot = self.current_song["index"] if self.current_song else 0
+            self._activate_emx_index(self.active_emx_index, current_slot)
+
+        self.status_var.set(f"Saved: {Path(p).name}")
+        messagebox.showinfo("Saved", f"Saved a new EMX file:\n{p}")
+
+    # ---------- timeline ----------
+    def fit_px_per_tick(self):
+        """Pixels/tick needed to fit the whole song in the visible timeline."""
+        total = max(1, self.total_ticks())
+        viewport = max(80, int(self._timeline_viewport_width))
+        # draw_timeline adds ~120 px of right-side breathing room.
+        usable = max(80, viewport - 120)
+        return max(0.01, usable / total)
+
+    def px_per_tick(self):
+        # O(1): total song length and viewport width are cached.
+        z = max(0.0, float(self.zoom.get()))
+        return self.fit_px_per_tick() * (1.0 + z)
+
+    def tick_to_x(self, tick):
+        # During normal drawing/interaction, use the already-rendered scale.
+        pxt = self._visual_pxt if self._visual_pxt is not None else self.px_per_tick()
+        return tick * pxt
+
+    def x_to_tick(self, x):
+        pxt = self._visual_pxt if self._visual_pxt is not None else self.px_per_tick()
+        return max(0, int(x / max(pxt, 1e-9)))
+
+    def total_ticks(self):
+        if not self.current_song:
+            return 128
+        return self._ensure_timeline_cache().get("total_ticks", 128)
+
+    def timeline_configure(self, event):
+        width = max(80, int(event.width))
+        width_changed = width != self._timeline_viewport_width
+        self._timeline_viewport_width = width
+        if width_changed:
+            # Fit zoom depends on viewport width; coalesce resize events.
+            self.request_timeline_redraw(delay=30)
+
+    def label_part_at_y(self, y):
+        """Return the visible sound-part row under a click in the fixed label canvas."""
+        cy = self.label_canvas.canvasy(y)
+        for part in range(len(PART_NAMES)):
+            py = self.part_row_y(part)
+            if py is not None and py <= cy < py + self.ROW_H:
+                return part
+        return None
+
+    def track_swap_group(self, part):
+        if 0 <= part <= 8:
+            return "drum"
+        if 10 <= part <= 14:
+            return "synth"
+        return None
+
+    def label_canvas_click(self, event):
+        """Select two tracks for swapping; mixed drum/synth pairs are forbidden."""
+        part = self.label_part_at_y(event.y)
+        group = self.track_swap_group(part) if part is not None else None
+        if group is None:
+            return
+
+        if part in self.selected_swap_tracks:
+            self.selected_swap_tracks.remove(part)
+        else:
+            # If one track is already selected, only allow another from same family.
+            if self.selected_swap_tracks:
+                first = next(iter(self.selected_swap_tracks))
+                first_group = self.track_swap_group(first)
+                if group != first_group:
+                    self.status_var.set(
+                        "Cannot swap a drum track with a synth track."
+                    )
+                    return
+            if len(self.selected_swap_tracks) >= 2:
+                self.selected_swap_tracks.clear()
+            self.selected_swap_tracks.add(part)
+
+        if len(self.selected_swap_tracks) == 2:
+            a, b = sorted(self.selected_swap_tracks)
+            if self.track_swap_group(a) == self.track_swap_group(b):
+                self.swap_synth_btn.state(["!disabled"])
+                self.status_var.set(
+                    f"Ready to swap {PART_NAMES[a]} ↔ {PART_NAMES[b]}"
+                )
+            else:
+                self.swap_synth_btn.state(["disabled"])
+        else:
+            self.swap_synth_btn.state(["disabled"])
+            if self.selected_swap_tracks:
+                p = next(iter(self.selected_swap_tracks))
+                family = self.track_swap_group(p)
+                self.status_var.set(
+                    f"Selected {PART_NAMES[p]} — choose another {family} track"
+                )
+            else:
+                self.status_var.set("Track selection cleared")
+
+        self.draw_timeline()
+
+    @staticmethod
+    def _swap_mask_bits(mask, bit_a, bit_b):
+        a = bool(mask & (1 << bit_a))
+        b = bool(mask & (1 << bit_b))
+        if a != b:
+            mask ^= (1 << bit_a) | (1 << bit_b)
+        return mask
+
+    @staticmethod
+    def _swap_automation_opcode(op, row_a, row_b):
+        """
+        Synth automation blocks:
+          rows 10..14 -> blocks 0..4
+
+        Drum automation blocks:
+          rows 0..8 -> blocks 5..13
+
+        Preserve the low 5-bit parameter id and exchange only the owner block.
+        """
+        block = op >> 5
+        code = op & 0x1F
+
+        def row_to_block(row):
+            if 10 <= row <= 14:
+                return row - 10
+            if 0 <= row <= 8:
+                return row + 5
+            return None
+
+        block_a = row_to_block(row_a)
+        block_b = row_to_block(row_b)
+        if block_a is None or block_b is None:
+            return op
+
+        if block == block_a:
+            return (block_b << 5) | code
+        if block == block_b:
+            return (block_a << 5) | code
+        return op
+
+    def swap_selected_tracks(self):
+        if not self.current_song or len(self.selected_swap_tracks) != 2:
+            return
+
+        row_a, row_b = sorted(self.selected_swap_tracks)
+        group_a = self.track_swap_group(row_a)
+        group_b = self.track_swap_group(row_b)
+
+        if group_a is None or group_a != group_b:
+            self.status_var.set("Drum↔synth swaps are disabled.")
+            return
+
+        mute_bit_a = ROW_TO_MUTE_BIT[row_a]
+        mute_bit_b = ROW_TO_MUTE_BIT[row_b]
+
+        self.push_undo()
+
+        note_count = 0
+        mute_count = 0
+        automation_count = 0
+
+        for e in self.current_song["events"]:
+            if e.op == OP_NOTE:
+                if e.part == row_a:
+                    e.part = row_b
+                    note_count += 1
+                elif e.part == row_b:
+                    e.part = row_a
+                    note_count += 1
+
+            elif e.op == OP_MUTE:
+                old_mask = e.mute_mask
+                new_mask = self._swap_mask_bits(old_mask, mute_bit_a, mute_bit_b)
+                if new_mask != old_mask:
+                    e.mute_mask = new_mask
+                    mute_count += 1
+
+            elif e.op != OP_TEMPO:
+                new_op = self._swap_automation_opcode(e.op, row_a, row_b)
+                if new_op != e.op:
+                    e.raw[2:4] = int(new_op).to_bytes(2, "big")
+                    automation_count += 1
+
+        self.invalidate_timeline_cache()
+        self.selected_event_indices.clear()
+        self.current_event = None
+        self.current_event_index = None
+        self.dirty = True
+
+        name_a = PART_NAMES[row_a]
+        name_b = PART_NAMES[row_b]
+        self.selected_swap_tracks.clear()
+        self.swap_synth_btn.state(["disabled"])
+        self.draw_timeline()
+        self.status_var.set(
+            f"Swapped {name_a} ↔ {name_b} • "
+            f"{note_count} notes • {mute_count} mute events • "
+            f"{automation_count} automation events"
+        )
+
+
+    def _vertical_scroll(self, *args):
+        self.canvas.yview(*args)
+        self.label_canvas.yview(*args)
+
+    def toggle_automation_visibility(self):
+        # Automation lanes are part of the vertical layout, so hiding/showing
+        # them requires rebuilding the cached row stack.
+        self.invalidate_timeline_cache()
+        self.draw_timeline()
+
+    def invalidate_timeline_cache(self):
+        self._timeline_cache = None
+
+    def _ensure_timeline_cache(self):
+        song = self.current_song
+        if song is None:
+            return {
+                "song": None, "ops": (), "lanes": (), "rows": (),
+                "part_y": {}, "automation_y": {},
+                "automation_events": {}, "automation_indices": (),
+                "note_indices": (), "mute_indices": (),
+                "total_ticks": 128,
+            }
+
+        cache = self._timeline_cache
+        # A cached layout remains valid while existing event objects move.
+        # Add/delete/undo/song changes explicitly invalidate it.
+        if cache is not None and cache.get("song") is song:
+            return cache
+
+        skip = {OP_NOTE, OP_MUTE, OP_TEMPO}
+        automation_events = {}
+        note_indices = []
+        mute_indices = []
+        maxpos = max(0, int(song.get("length", 1)) - 1)
+
+        for idx, e in enumerate(song["events"]):
+            if e.position > maxpos:
+                maxpos = e.position
+            if e.op == OP_NOTE:
+                note_indices.append(idx)
+            elif e.op == OP_MUTE:
+                mute_indices.append(idx)
+            elif e.op not in skip:
+                automation_events.setdefault(e.op, []).append((idx, e))
+
+        ops = tuple(sorted(automation_events))
+        by_parent = {p: [] for p in range(len(PART_NAMES))}
+        unparented = []
+
+        for op in ops:
+            parent_row, owner, param, confidence = self.decode_automation(op)
+            if parent_row is not None and parent_row in by_parent:
+                by_parent[parent_row].append(op)
+            else:
+                unparented.append(op)
+
+        rows = []
+        automation_visible = bool(self.show_automation.get())
+        for part in range(len(PART_NAMES)):
+            rows.append(("part", part))
+            if automation_visible:
+                for op in by_parent[part]:
+                    rows.append(("automation", op, part))
+        if automation_visible:
+            for op in unparented:
+                rows.append(("automation", op, None))
+
+        base_y = 35 + self.PATTERN_H
+        part_y = {}
+        automation_y = {}
+        for i, row in enumerate(rows):
+            y = base_y + i * self.ROW_H
+            if row[0] == "part":
+                part_y[row[1]] = y
+            else:
+                automation_y[row[1]] = y
+
+        cache = {
+            "song": song,
+            "ops": ops,
+            "lanes": tuple((self.decode_automation(op)[0], op) for op in ops),
+            "rows": tuple(rows),
+            "part_y": part_y,
+            "automation_y": automation_y,
+            "automation_events": automation_events,
+            "automation_indices": tuple(
+                idx for op in ops for idx, e in automation_events[op]
+            ),
+            "note_indices": tuple(note_indices),
+            "mute_indices": tuple(mute_indices),
+            "total_ticks": max(1, (maxpos + 1) * self.TICKS_PER_POSITION),
+        }
+        self._timeline_cache = cache
+        return cache
+
+    def automation_ops(self):
+        return list(self._ensure_timeline_cache()["ops"])
+
+    def automation_lanes(self):
+        return list(self._ensure_timeline_cache()["lanes"])
+
+    def decode_automation(self, op):
+        """Return (timeline_row_or_None, owner_label, parameter_label, confidence)."""
+        block = op >> 5
+        code = op & 0x1F
+
+        if 0 <= block <= 4:
+            row = 10 + block
+            owner = f"Synth {block + 1}"
+            param = SYNTH_AUTOMATION_PARAMS.get(code, f"Control 0x{code:02X}")
+            confidence = "verified" if op == 0x0007 else "decoded"
+            return row, owner, param, confidence
+
+        if 5 <= block <= 13:
+            d = block - 5
+            param = DRUM_AUTOMATION_PARAMS.get(code, f"Control 0x{code:02X}")
+            return d, DRUM_PART_LABELS[d], param, "decoded"
+
+        if 0x1E0 <= op < 0x1F7:
+            name = SPECIAL_AUTOMATION_NAMES.get(op, f"Control 0x{op:03X}")
+            return None, "FX / Common", name, "decoded"
+
+        return None, "Automation", f"Control 0x{op:04X}", "unresolved"
+
+    def automation_lane_label(self, part, op):
+        row, owner, param, confidence = self.decode_automation(op)
+        return f"{owner}  •  {param}"
+
+    def row_layout(self):
+        return list(self._ensure_timeline_cache()["rows"])
+
+    def part_row_y(self, part):
+        return self._ensure_timeline_cache()["part_y"].get(part)
+
+    def automation_row_y(self, lane):
+        op = lane[1] if isinstance(lane, tuple) else lane
+        return self._ensure_timeline_cache()["automation_y"].get(op)
+
+    def request_timeline_redraw(self, delay=40):
+        """Coalesce rapid edits; native canvas movement keeps dragging responsive."""
+        if self._redraw_after is not None:
+            return
+        self._redraw_after = self.after(delay, self._run_scheduled_redraw)
+
+    def _run_scheduled_redraw(self):
+        self._redraw_after = None
+        self.draw_timeline()
+
+
+    def _center_playhead_view(self):
+        if not self.current_song:
+            return
+
+        if float(self.zoom.get()) <= 0.0001:
+            self.canvas.xview_moveto(0.0)
+            return
+
+        px = self.tick_to_x(self.play_tick)
+        bbox = self.canvas.bbox("all")
+        total_width = max(1, bbox[2] if bbox else 1)
+        viewport = max(1, self._timeline_viewport_width)
+        desired = max(0, px - viewport / 2)
+        self.canvas.xview_moveto(min(1, desired / total_width))
+
+    def slider_zoom(self, value=None):
+        # Same simple redraw path used by the working V8 implementation.
+        if self._zoom_after is not None:
+            try:
+                self.after_cancel(self._zoom_after)
+            except Exception:
+                pass
+        self._zoom_after = self.after(18, self._finish_playhead_zoom)
+        return "break"
+
+    def _finish_playhead_zoom(self):
+        self._zoom_after = None
+        self._visual_pxt = None
+        self.draw_timeline()
+        self._center_playhead_view()
+
+    def _apply_zoom_at_playhead(self, factor):
+        old = max(0.0, float(self.zoom.get()))
+
+        # 0 means Fit Song. Scale actual magnification (1 + zoom), so wheel
+        # zoom can move away from and back to the fit state.
+        old_mag = 1.0 + old
+        new_mag = max(1.0, min(13.0, old_mag * factor))
+        new = new_mag - 1.0
+
+        if abs(new - old) < 1e-9:
+            return "break"
+
+        self.zoom.set(new)
+
+        if self._zoom_after is not None:
+            try:
+                self.after_cancel(self._zoom_after)
+            except Exception:
+                pass
+
+        # Debounce rapid trackpad events exactly like V8.
+        self._zoom_after = self.after(18, self._finish_playhead_zoom)
+        return "break"
+
+    def timeline_wheel_zoom(self, event):
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            return "break"
+
+        # V8 behavior: macOS trackpads can emit small deltas, traditional
+        # wheels often emit +/-120.
+        magnitude = min(
+            4.0,
+            max(
+                0.25,
+                abs(delta) / 120.0 if abs(delta) >= 10 else abs(delta)
+            )
+        )
+        factor = (1.12 ** magnitude) if delta > 0 else (1 / 1.12) ** magnitude
+        return self._apply_zoom_at_playhead(factor)
+
+    def timeline_wheel_zoom_linux(self, event, direction):
+        return self._apply_zoom_at_playhead(
+            1.15 if direction > 0 else 1 / 1.15
+        )
+
+
+    def draw_timeline(self):
+        # A direct/full redraw supersedes any queued redraw.
+        if self._redraw_after is not None:
+            try:
+                self.after_cancel(self._redraw_after)
+            except Exception:
+                pass
+            self._redraw_after = None
+
+        c = self.canvas
+        lc = self.label_canvas
+        c.delete("all")
+        lc.delete("all")
+        if not self.current_song:
+            return
+
+        cache = self._ensure_timeline_cache()
+        total = self.total_ticks()
+        pxt = self.px_per_tick()
+        self._visual_pxt = pxt
+        timeline_width = total * pxt + 120
+        automation_lanes = cache["lanes"]
+        rows = cache["rows"]
+        height = 35 + self.PATTERN_H + len(rows) * self.ROW_H + 5
+
+        c.configure(scrollregion=(0, 0, timeline_width, height))
+        lc.configure(scrollregion=(0, 0, self.LEFT_W, height))
+
+        # Timeline header and grid.
+        c.create_rectangle(0, 0, timeline_width, 34,
+                           fill="#202020", outline="")
+        positions = max(1, (total + 127) // 128)
+        for pos in range(positions):
+            x = self.tick_to_x(pos * 128)
+            c.create_line(x, 0, x, height, fill="#555555")
+            c.create_text(x + 4, 17, anchor="w", text=f"{pos+1}",
+                          fill="#dddddd", font=("", 9, "bold"))
+            for q in range(1, 4):
+                xx = self.tick_to_x(pos * 128 + q * 32)
+                c.create_line(xx, 34, xx, height, fill="#303030")
+
+        # Native EMX song pattern sequence / pattern-change lane.
+        py0 = 35
+        py1 = py0 + self.PATTERN_H
+        c.create_rectangle(0, py0, timeline_width, py1, fill="#262626", outline="")
+        lc.create_rectangle(0, py0, self.LEFT_W, py1, fill="#303030", outline="")
+        lc.create_text(8, (py0 + py1) // 2, anchor="w",
+                       text="PATTERN", fill="#eeeeee", font=("", 9, "bold"))
+
+        song_len = max(1, min(256, int(self.current_song.get("length", 1))))
+        patterns = self.current_song.get("patterns", [])
+        previous = None
+        for pos in range(song_len):
+            value = patterns[pos] if pos < len(patterns) else 0
+            x0 = self.tick_to_x(pos * 128)
+            changed = previous is None or value != previous
+            if changed:
+                c.create_line(x0, py0, x0, py1, fill="#f0b85a", width=2)
+            if pos == self.selected_pattern_pos:
+                x1 = self.tick_to_x((pos + 1) * 128)
+                c.create_rectangle(x0 + 1, py0 + 1, x1 - 1, py1 - 1,
+                                   outline="#ffffff", width=1)
+            c.create_text(x0 + 5, (py0 + py1) // 2, anchor="w",
+                          text=pattern_name(value),
+                          fill="#f0d7a1" if changed else "#aaaaaa",
+                          font=("", 9, "bold" if changed else "normal"),
+                          tags=(f"pattern:{pos}",))
+            previous = value
+
+        c.create_line(0, py1, timeline_width, py1, fill="#444444")
+        lc.create_line(0, py1, self.LEFT_W, py1, fill="#444444")
+
+        # Part rows with each part's active automation lanes directly underneath.
+        lc.create_rectangle(0, 0, self.LEFT_W, 34, fill="#202020", outline="")
+        for ri,rowdata in enumerate(rows):
+            rtype=rowdata[0]
+            y0=35+self.PATTERN_H+ri*self.ROW_H;y1=y0+self.ROW_H
+            if rtype=="part":
+                part=rowdata[1];name=PART_NAMES[part]
+                track_selected = part in self.selected_swap_tracks
+                lc.create_rectangle(
+                    0, y0, self.LEFT_W, y1,
+                    fill="#3a4650" if track_selected else "#242424",
+                    outline="#ffffff" if track_selected else "",
+                    width=2 if track_selected else 1
+                )
+                lc.create_text(
+                    8, (y0+y1)//2, anchor="w",
+                    text=f"{part+1:02d}  {name}",
+                    fill="#ffffff" if track_selected else "#eeeeee",
+                    font=("", 9, "bold" if track_selected else "normal")
+                )
+                c.create_rectangle(0,y0,timeline_width,y1,
+                    fill="#1b1b1b" if part%2==0 else "#181818",outline="")
+                c.create_line(0,y1,timeline_width,y1,fill="#292929")
+                lc.create_line(0,y1,self.LEFT_W,y1,fill="#292929")
+            else:
+                if not self.show_automation.get():
+                    continue
+                aop=rowdata[1]
+                parent_row=rowdata[2]
+                lc.create_rectangle(0,y0,self.LEFT_W,y1,fill="#20252a",outline="")
+                decoded=self.decode_automation(aop)
+                lane_text=("↳ "+decoded[2]) if parent_row is not None else (decoded[1]+" • "+decoded[2])
+                lc.create_text(14,(y0+y1)//2,anchor="w",
+                    text=lane_text,
+                    fill="#d7e5ef",font=("",8,"bold"))
+                c.create_rectangle(0,y0,timeline_width,y1,fill="#151a1e",outline="")
+                c.create_line(0,y1,timeline_width,y1,fill="#35404a")
+                evs = cache["automation_events"].get(aop, ())
+                # Event objects move in time during dragging, so sort the small
+                # lane-local list rather than rescanning the whole song.
+                evs = sorted(evs, key=lambda z:(z[1].position,z[1].raw[1]))
+                points=[]
+                for idx,e in evs:
+                    x=self.tick_to_x(e.position*128+e.raw[1]);value=max(0,min(127,e.raw[5]))
+                    yy=y1-4-(value/127.0)*(self.ROW_H-8);points.append((x,yy))
+                if len(points)>1:
+                    c.create_line(*[v for pt in points for v in pt],fill="#79b7df",width=2)
+                for (idx,e),(x,yy) in zip(evs,points):
+                    selected = idx in self.selected_event_indices
+                    rr = 5 if selected else 3
+                    c.create_oval(
+                        x-rr, yy-rr, x+rr, yy+rr,
+                        fill="#bde3ff",
+                        outline="#ffffff" if selected else "#17374c",
+                        width=2 if selected else 1,
+                        tags=(f"ev:{idx}",)
+                    )
+                    if len(evs)<=24:
+                        c.create_text(x+4,yy-5,anchor="sw",text=str(e.raw[5]),fill="#9fc4dc",
+                                      font=("",7),tags=(f"ev:{idx}",))
+
+        # Live notes.
+        if self.show_notes.get():
+            for idx in cache["note_indices"]:
+                e = self.current_song["events"][idx]
+                if e.part >= len(PART_NAMES):
+                    continue
+                x = self.tick_to_x(e.position * 128 + e.raw[1])
+                y0 = self.part_row_y(e.part) + 5
+                w = max(5, min(80, e.length * pxt))
+                selected = idx in self.selected_event_indices
+                c.create_rectangle(
+                    x, y0, x + w, y0 + self.ROW_H - 10,
+                    fill="#55aaff",
+                    outline="#ffffff" if selected else "#b9e1ff",
+                    width=2 if selected else 1,
+                    tags=(f"ev:{idx}",)
+                )
+                c.create_text(
+                    x + 3, y0 + 5, anchor="nw",
+                    text=midi_note_name(e.note), fill="#07121b",
+                    tags=(f"ev:{idx}",)
+                )
+
+        # Mute events.
+        if self.show_mutes.get():
+            for idx in cache["mute_indices"]:
+                e = self.current_song["events"][idx]
+                x = self.tick_to_x(e.position * 128 + e.raw[1])
+                c.create_line(
+                    x, 34, x, height,
+                    fill="#d5a84b", width=1, dash=(2, 3),
+                    tags=(f"mute_line:{idx}",)
+                )
+                for bit, row in MUTE_BIT_TO_ROW.items():
+                    muted = bool(e.mute_mask & (1 << bit))
+                    y0 = self.part_row_y(row) + 8
+                    selected = idx in self.selected_event_indices
+                    c.create_rectangle(
+                        x - 2, y0, x + 4, y0 + 10,
+                        fill="#d05a5a" if muted else "#4d9b67",
+                        outline="#ffffff" if selected else "",
+                        width=1,
+                        tags=(f"ev:{idx}",)
+                    )
+
+        # Playhead.
+        px = self.tick_to_x(self.play_tick)
+        c.create_line(px, 0, px, height,
+                      fill="#ffffff", width=2, tags=("playhead",))
+
+    def _pattern_position_at(self, x, y):
+        if not self.current_song:
+            return None
+        if not (35 <= y < 35 + self.PATTERN_H):
+            return None
+        pos = int(max(0, x) // max(1, self.tick_to_x(128)))
+        if 0 <= pos < max(1, int(self.current_song.get("length", 1))):
+            return pos
+        return None
+
+    def _event_index_at(self, x, y):
+        # Only count items actually under/very near the pointer.  The old
+        # find_closest() made empty-space clicks select distant events.
+        items=self.canvas.find_overlapping(x-4,y-4,x+4,y+4)
+        for item in reversed(items):
+            for tag in self.canvas.gettags(item):
+                if tag.startswith("ev:"):
+                    try:
+                        return int(tag.split(":",1)[1])
+                    except ValueError:
+                        pass
+        return None
+
+
+    def _automation_lane_at(self,y):
+        for row in self.row_layout():
+            if row[0] != "automation":
+                continue
+            op = row[1]
+            top = self.automation_row_y(op)
+            if top is not None and top <= y < top + self.ROW_H:
+                return (self.decode_automation(op)[0], op)
+        return None
+
+
+    def _automation_point_xy(self, e):
+        top=self.automation_row_y(e.op)
+        if top is None:return None
+        x=self.tick_to_x(e.position*128+e.raw[1])
+        y=top+self.ROW_H-4-(max(0,min(127,e.raw[5]))/127.0)*(self.ROW_H-8)
+        return x,y
+
+    def _automation_event_at(self,x,y,radius=7):
+        if not self.current_song:
+            return None
+        items = self.canvas.find_overlapping(
+            x-radius, y-radius, x+radius, y+radius
+        )
+        for item in reversed(items):
+            for tag in self.canvas.gettags(item):
+                if not tag.startswith("ev:"):
+                    continue
+                try:
+                    idx = int(tag.split(":",1)[1])
+                except ValueError:
+                    continue
+                if 0 <= idx < len(self.current_song["events"]):
+                    e = self.current_song["events"][idx]
+                    if self._event_is_automation(e):
+                        return idx
+        return None
+
+
+    def _set_automation_from_xy(self,e,x,y):
+        tick=max(0,min(self.total_ticks()-1,self.x_to_tick(x)))
+        e.position=max(0,min(255,tick//128))
+        e.raw[1]=max(0,min(127,tick%128))
+        top=self.automation_row_y(e.op)
+        if top is None:return
+        frac=(top+self.ROW_H-4-y)/max(1,self.ROW_H-8)
+        e.raw[5]=max(0,min(127,round(frac*127)))
+
+    def canvas_double_click(self,event):
+        x=self.canvas.canvasx(event.x);y=self.canvas.canvasy(event.y)
+
+        pattern_pos=self._pattern_position_at(x,y)
+        if pattern_pos is not None:
+            self.begin_inline_pattern_edit(pattern_pos)
+            return
+
+        lane=self._automation_lane_at(y)
+        if lane is not None:
+            self.create_automation_point(x=x,y=y,lane=lane)
+
+    def parse_pattern_code(self, text):
+        txt=text.strip().upper().replace(".", "")
+        if len(txt) < 2 or txt[0] not in "ABCD":
+            raise ValueError("Use a pattern code from A01 to D64.")
+        try:
+            number=int(txt[1:])
+        except ValueError:
+            raise ValueError("Use a pattern code from A01 to D64.")
+        if not 1 <= number <= 64:
+            raise ValueError("Pattern number must be 01 to 64.")
+        return "ABCD".index(txt[0])*64 + number-1
+
+    def begin_inline_pattern_edit(self, pos):
+        if not self.current_song:return
+        if hasattr(self, "_pattern_entry") and self._pattern_entry is not None:
+            try:self._pattern_entry.destroy()
+            except Exception:pass
+        value=self.current_song["patterns"][pos]
+        x0=self.tick_to_x(pos*128)+4
+        y0=35+self.PATTERN_H/2
+        entry=ttk.Entry(self.canvas,width=6)
+        entry.insert(0,pattern_name(value))
+        entry.select_range(0,"end")
+        self._pattern_entry=entry
+        win=self.canvas.create_window(x0,y0,window=entry,anchor="w",width=52)
+        entry.focus_set()
+
+        def finish(commit=True):
+            if commit:
+                try:
+                    newval=self.parse_pattern_code(entry.get())
+                except ValueError as ex:
+                    messagebox.showerror("Pattern",str(ex))
+                    entry.focus_set()
+                    return
+                self.push_undo()
+                patterns=self.current_song["patterns"]
+                oldval=patterns[pos]
+
+                # If this cell is the start of a contiguous repeated-pattern run
+                # (the yellow "pattern change" cell), rename the whole run.
+                chain_end=pos+1
+                song_len=max(1,min(256,int(self.current_song.get("length",1))))
+                while chain_end<song_len and patterns[chain_end]==oldval:
+                    chain_end+=1
+
+                # Only propagate when this position begins a run/change block.
+                is_chain_start=(pos==0 or patterns[pos-1]!=oldval)
+                if is_chain_start:
+                    for i in range(pos,chain_end):
+                        patterns[i]=newval
+                    changed_count=chain_end-pos
+                else:
+                    patterns[pos]=newval
+                    changed_count=1
+
+                if pos+1>self.current_song["length"]:
+                    self.current_song["length"]=pos+1
+                self.selected_pattern_pos=pos
+                self.dirty=True
+                if changed_count>1:
+                    self.status_var.set(
+                        f"Pattern chain {pos+1}-{chain_end}: {pattern_name(oldval)} → {pattern_name(newval)}"
+                    )
+                else:
+                    self.status_var.set(f"Pattern position {pos+1}: {pattern_name(newval)}")
+            try:self.canvas.delete(win)
+            except Exception:pass
+            try:entry.destroy()
+            except Exception:pass
+            self._pattern_entry=None
+            self.draw_timeline()
+
+        entry.bind("<Return>",lambda e:finish(True))
+        entry.bind("<Escape>",lambda e:finish(False))
+        entry.bind("<FocusOut>",lambda e:finish(True))
+
+    def create_automation_point(self,x=None,y=None,lane=None):
+        if not self.current_song:return
+        if lane is None:
+            lanes=self.automation_lanes()
+            # Prefer the selected automation event's lane; otherwise first visible lane.
+            if self.current_event and self.current_event.op not in (OP_NOTE,OP_MUTE,OP_TEMPO):
+                lane=(self.decode_automation(self.current_event.op)[0], self.current_event.op)
+            elif lanes:lane=lanes[0]
+            else:
+                messagebox.showinfo("Automation","This song has no automation lane to clone yet.")
+                return
+        visual_row,op=lane
+        part=0
+        if x is None:
+            tick=self.play_tick;x=self.tick_to_x(tick)
+        if y is None:
+            top=self.automation_row_y(lane)
+            # Carry nearest previous value, default centre.
+            prev=[e for e in self.current_song["events"] if e.op==op
+                  and e.position*128+e.raw[1]<=self.play_tick]
+            value=prev[-1].raw[5] if prev else 64
+            y=top+self.ROW_H-4-(value/127.0)*(self.ROW_H-8)
+        self.push_undo()
+        raw=bytearray([0,0,(op>>8)&255,op&255,part,64,0xAA,0xAA])
+        e=Event(raw,len(self.current_song["events"]))
+        self._set_automation_from_xy(e,x,y)
+        self.current_song["events"].append(e)
+        self.current_song["events"].sort(key=lambda z:(z.position,z.raw[1],z.source_index))
+        self.invalidate_timeline_cache()
+        idx=self.current_song["events"].index(e)
+        self.selected_event_indices={idx};self.select_event(idx)
+        self.dirty=True;self.draw_timeline()
+
+    def part_at_y(self,y):
+        for part in range(len(PART_NAMES)):
+            py=self.part_row_y(part)
+            if py is not None and py<=y<py+self.ROW_H:
+                return part
+        return None
+
+    def add_mute_change_at(self, tick, row):
+        bit=ROW_TO_MUTE_BIT.get(row)
+        if bit is None:
+            self.status_var.set("Accent parts are not stored in song mute events.")
+            return
+
+        tick=max(0,min(self.total_ticks()-1,int(tick)))
+        pos=tick//128
+        clock=tick%128
+
+        # Start from the last recorded mute state at/before this time,
+        # then toggle only the clicked track.
+        mask=0
+        for e in sorted(
+            (e for e in self.current_song["events"] if e.op==OP_MUTE),
+            key=lambda z:(z.position,z.raw[1])
+        ):
+            et=e.position*128+e.raw[1]
+            if et<=tick:mask=e.mute_mask
+            else:break
+        mask ^= (1<<bit)
+
+        self.push_undo()
+        e=Event(bytearray(8),len(self.current_song["events"]))
+        e.position=pos
+        e.raw[1]=clock
+        e.raw[2:4]=OP_MUTE.to_bytes(2,"big")
+        e.mute_mask=mask
+        self.current_song["events"].append(e)
+        self.current_song["events"].sort(key=lambda z:(z.position,z.raw[1],z.source_index))
+        self.invalidate_timeline_cache()
+        idx=self.current_song["events"].index(e)
+        self.selected_event_indices={idx}
+        self.select_event(idx)
+        self.dirty=True
+        self.draw_timeline()
+        self.status_var.set(
+            f"Added mute change: {MUTE_PART_NAMES[bit]} at position {pos+1}, clock {clock}"
+        )
+
+    def add_note_at(self,tick,part,note=60):
+        if part is None or not 0<=part<len(PART_NAMES):
+            return
+        tick=max(0,min(self.total_ticks()-1,int(tick)))
+        pos=tick//128
+        clock=tick%128
+
+        self.push_undo()
+        e=Event(bytearray(8),len(self.current_song["events"]))
+        e.position=pos
+        e.raw[1]=clock
+        e.raw[2:4]=OP_NOTE.to_bytes(2,"big")
+        e.part=part
+        e.note=note
+        e.length=16
+        self.current_song["events"].append(e)
+        self.current_song["events"].sort(key=lambda z:(z.position,z.raw[1],z.source_index))
+        self.invalidate_timeline_cache()
+        idx=self.current_song["events"].index(e)
+        self.selected_event_indices={idx}
+        self.select_event(idx)
+        self.dirty=True
+        self.draw_timeline()
+        self.status_var.set(
+            f"Added note on {PART_NAMES[part]} at position {pos+1}, clock {clock}"
+        )
+
+    def canvas_ctrl_click(self, event):
+        """Ctrl-click a sound-part row: add one mute change immediately."""
+        if not self.current_song:
+            return "break"
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        row = self.part_at_y(y)
+        if row is not None:
+            self.canvas.focus_set()
+            self.add_mute_change_at(self.x_to_tick(x), row)
+        return "break"
+
+    def canvas_shift_click(self, event):
+        """Shift-click empty/track space: add a note immediately."""
+        if not self.current_song:
+            return "break"
+
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        row = self.part_at_y(y)
+
+        if row is not None:
+            self.canvas.focus_set()
+            note = 60
+            if self.current_event is not None and self.current_event.op == OP_NOTE:
+                note = self.current_event.note
+            self.add_note_at(self.x_to_tick(x), row, note)
+
+        return "break"
+
+    def canvas_cmd_note_drag(self, event):
+        """
+        Cmd+press on an existing note starts a vertical-only drag.
+        Horizontal song position/step is locked for the entire drag.
+        """
+        if not self.current_song:
+            return "break"
+
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        self.canvas.focus_set()
+
+        idx = self._event_index_at(x, y)
+        if idx is None or not (0 <= idx < len(self.current_song["events"])):
+            return "break"
+
+        e = self.current_song["events"][idx]
+        if e.op != OP_NOTE:
+            return "break"
+
+        self.selected_pattern_pos = None
+        if idx not in self.selected_event_indices:
+            self.selected_event_indices = {idx}
+
+        self.select_event(idx)
+        self._start_group_drag(idx, x, y)
+
+        if self.group_drag is not None:
+            self.group_drag["vertical_only"] = True
+
+        self.draw_timeline()
+        return "break"
+
+
+    def clear_event_selection(self):
+        self.selected_event_indices.clear()
+        self.current_event = None
+        self.current_event_index = None
+        self.group_drag = None
+
+    def _event_is_automation(self, e):
+        return e.op not in (OP_NOTE, OP_MUTE, OP_TEMPO)
+
+    def _start_group_drag(self, idx, x, y, mute_toggle_bit=None):
+        """Prepare drag of the current selection. Clicking a selected item keeps the group."""
+        if idx not in self.selected_event_indices:
+            self.selected_event_indices = {idx}
+
+        selected = sorted(
+            i for i in self.selected_event_indices
+            if 0 <= i < len(self.current_song["events"])
+        )
+        originals = {
+            i: bytearray(self.current_song["events"][i].raw)
+            for i in selected
+        }
+        primary = self.current_song["events"][idx]
+
+        self.group_drag = {
+            "primary": idx,
+            "indices": selected,
+            "originals": originals,
+            "x0": x,
+            "y0": y,
+            "visual_x": x,
+            "visual_y": y,
+            "moved": False,
+            "mute_toggle_bit": mute_toggle_bit,
+            "single_automation": (
+                len(selected) == 1 and self._event_is_automation(primary)
+            ),
+            "primary_is_note": primary.op == OP_NOTE,
+            "vertical_only": False,
+            "original_parts": {
+                i: self.current_song["events"][i].part
+                for i in selected
+                if 0 <= i < len(self.current_song["events"])
+            },
+        }
+        self.drag_select_start = None
+
+    def _move_selected_events(self, x, y):
+        drag = self.group_drag
+        if not drag:
+            return
+
+        pxt = max(
+            self._visual_pxt if self._visual_pxt is not None else self.px_per_tick(),
+            1e-9
+        )
+        if drag.get("primary_is_note") and drag.get("vertical_only"):
+            raw_delta = 0
+        else:
+            raw_delta = int(round((x - drag["x0"]) / pxt))
+
+        original_ticks = []
+        for i in drag["indices"]:
+            raw = drag["originals"][i]
+            original_ticks.append(raw[0] * 128 + raw[1])
+
+        if not original_ticks:
+            return
+
+        min_delta = -min(original_ticks)
+        max_delta = (self.total_ticks() - 1) - max(original_ticks)
+        delta = max(min_delta, min(max_delta, raw_delta))
+
+        if abs(x - drag["x0"]) > 2 or abs(y - drag["y0"]) > 2:
+            drag["moved"] = True
+
+        for i in drag["indices"]:
+            if not (0 <= i < len(self.current_song["events"])):
+                continue
+            e = self.current_song["events"][i]
+            raw0 = drag["originals"][i]
+            original_tick = raw0[0] * 128 + raw0[1]
+            tick = max(0, min(self.total_ticks() - 1, original_tick + delta))
+            e.position = tick // 128
+            e.raw[1] = tick % 128
+
+        # A single automation point keeps its vertical-value editing behavior.
+        if drag["single_automation"]:
+            idx = drag["primary"]
+            e = self.current_song["events"][idx]
+            top = self.automation_row_y(e.op)
+            if top is not None:
+                yy = max(top + 4, min(top + self.ROW_H - 4, y))
+                frac = (top + self.ROW_H - 4 - yy) / max(1, self.ROW_H - 8)
+                e.raw[5] = max(0, min(127, round(frac * 127)))
+
+        # Note events can be dropped onto another synth track.
+        # Only synth->synth reassignment is enabled here.
+        if drag.get("primary_is_note"):
+            target_part = self.part_at_y(y)
+            primary_idx = drag["primary"]
+            primary_event = self.current_song["events"][primary_idx]
+            source_part = drag["original_parts"].get(primary_idx, primary_event.part)
+
+            if (
+                target_part is not None
+                and 10 <= source_part <= 14
+                and 10 <= target_part <= 14
+            ):
+                part_delta = target_part - source_part
+
+                # Move all selected synth-note events by the same track offset
+                # when that keeps them inside Synth 1..5.
+                for i in drag["indices"]:
+                    if not (0 <= i < len(self.current_song["events"])):
+                        continue
+                    e = self.current_song["events"][i]
+                    if e.op != OP_NOTE:
+                        continue
+                    orig_part = drag["original_parts"].get(i, e.part)
+                    new_part = orig_part + part_delta
+                    if 10 <= orig_part <= 14 and 10 <= new_part <= 14:
+                        e.part = new_part
+
+        primary = self.current_song["events"][drag["primary"]]
+        self._loading_event_fields = True
+        self.vars["position"].set(str(primary.position + 1))
+        self.vars["clock"].set(str(primary.raw[1]))
+        self.vars["part"].set(str(primary.part + 1))
+        self.vars["note"].set(str(primary.raw[5] if self._event_is_automation(primary) else primary.note))
+        self.vars["length"].set(str(primary.length))
+        self.vars["mask"].set(f"0x{primary.mute_mask:04X}")
+        self._loading_event_fields = False
+
+        if self._event_is_automation(primary):
+            self.info.config(
+                text=f"Event #{drag['primary']}   "
+                     f"{self.automation_lane_label(primary.part, primary.op)}   "
+                     f"value {primary.raw[5]}"
+            )
+
+        # Immediate native-Tk movement makes the pointer feel direct even though
+        # the expensive full timeline rebuild is throttled.
+        dx = x - drag["visual_x"]
+        if drag.get("primary_is_note") and drag.get("vertical_only"):
+            dx = 0
+
+        # Automation points move vertically by value; synth notes follow the
+        # pointer vertically. With Shift held, horizontal movement is zero.
+        if drag["single_automation"] or drag.get("primary_is_note"):
+            dy = y - drag["visual_y"]
+        else:
+            dy = 0
+
+        if dx or dy:
+            for i in drag["indices"]:
+                item_dy = 0
+                if drag["single_automation"] and i == drag["primary"]:
+                    item_dy = dy
+                elif drag.get("primary_is_note"):
+                    e = self.current_song["events"][i]
+                    if e.op == OP_NOTE:
+                        item_dy = dy
+                self.canvas.move(f"ev:{i}", dx, item_dy)
+            # For constrained note drag, keep visual_x fixed so small pointer
+            # jitter can never accumulate into horizontal movement.
+            if not (drag.get("primary_is_note") and drag.get("vertical_only")):
+                drag["visual_x"] = x
+            drag["visual_y"] = y
+
+        self.request_timeline_redraw(delay=45)
+
+    def _finish_group_drag(self):
+        drag = self.group_drag
+        if not drag:
+            return False
+
+        if drag["moved"]:
+            # One undo step restores the entire group to its pre-drag bytes.
+            snap = self.snapshot_song()
+            event_snap = snap["events"]
+            for i, raw in drag["originals"].items():
+                if 0 <= i < len(event_snap):
+                    event_snap[i] = bytearray(raw)
+            self.undo_stack.append((self.current_song["index"], snap))
+            if len(self.undo_stack) > 100:
+                self.undo_stack.pop(0)
+
+            selected_objects = [
+                self.current_song["events"][i]
+                for i in drag["indices"]
+                if 0 <= i < len(self.current_song["events"])
+            ]
+            primary_obj = (
+                self.current_song["events"][drag["primary"]]
+                if 0 <= drag["primary"] < len(self.current_song["events"])
+                else None
+            )
+
+            # Keep native event stream chronological after a move.
+            self.current_song["events"].sort(
+                key=lambda e: (e.position, e.raw[1], e.source_index)
+            )
+            self.invalidate_timeline_cache()
+
+            wanted_ids={id(obj) for obj in selected_objects}
+            primary_id=id(primary_obj) if primary_obj is not None else None
+            new_selection=set()
+            new_primary=None
+            for new_idx,obj in enumerate(self.current_song["events"]):
+                oid=id(obj)
+                if oid in wanted_ids:
+                    new_selection.add(new_idx)
+                if oid==primary_id:
+                    new_primary=(new_idx,obj)
+
+            self.selected_event_indices=new_selection
+            if new_primary is not None:
+                self.current_event_index,self.current_event=new_primary
+
+            self.dirty = True
+
+            # Report synth-track reassignment if the primary note changed part.
+            if drag.get("primary_is_note") and self.current_event is not None:
+                orig_part = drag["original_parts"].get(drag["primary"])
+                new_part = self.current_event.part
+                if (
+                    orig_part is not None
+                    and new_part != orig_part
+                    and 10 <= orig_part <= 14
+                    and 10 <= new_part <= 14
+                ):
+                    self.status_var.set(
+                        f"Moved note event(s): {PART_NAMES[orig_part]} → {PART_NAMES[new_part]}"
+                    )
+        else:
+            # A simple click on a mute handle toggles that part's state.
+            bit = drag.get("mute_toggle_bit")
+            idx = drag["primary"]
+            if bit is not None and 0 <= idx < len(self.current_song["events"]):
+                self.push_undo()
+                e = self.current_song["events"][idx]
+                e.mute_mask ^= (1 << bit)
+                self.dirty = True
+                self.select_event(idx)
+
+        self.group_drag = None
+        self.draw_timeline()
+        return True
+
+    def canvas_click(self, event):
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+
+        if self.current_song is None:
+            return
+
+        self.canvas.focus_set()
+        self.drag_select_rect = None
+
+        # Modifier shortcuts are handled by dedicated bindings, but retain this
+        # fallback for Tk builds that report them through the generic binding.
+        ctrl = bool(event.state & 0x0004)
+        row = self.part_at_y(y)
+        if ctrl and row is not None:
+            self.add_mute_change_at(self.x_to_tick(x), row)
+            return "break"
+
+        pattern_pos = self._pattern_position_at(x, y)
+        if pattern_pos is not None:
+            self.clear_event_selection()
+            self.selected_pattern_pos = pattern_pos
+            self.play_tick = pattern_pos * 128
+            patterns = self.current_song.get("patterns", [])
+            value = patterns[pattern_pos] if pattern_pos < len(patterns) else 0
+            self.status_var.set(
+                f"Selected pattern position {pattern_pos + 1}: {pattern_name(value)}"
+            )
+            self.draw_timeline()
+            return
+
+        # Prefer exact automation-point hit testing.
+        idx = self._automation_event_at(x, y)
+        if idx is None:
+            idx = self._event_index_at(x, y)
+
+        if idx is not None and 0 <= idx < len(self.current_song["events"]):
+            e = self.current_song["events"][idx]
+            self.selected_pattern_pos = None
+
+            # Preserve an existing multi-selection when grabbing any selected item.
+            if idx not in self.selected_event_indices:
+                self.selected_event_indices = {idx}
+            self.select_event(idx)
+
+            mute_bit = None
+            if e.op == OP_MUTE:
+                clicked_row = self.part_at_y(y)
+                mute_bit = ROW_TO_MUTE_BIT.get(clicked_row)
+
+            self._start_group_drag(idx, x, y, mute_toggle_bit=mute_bit)
+            self.draw_timeline()
+            return
+
+        # Empty-space click clears selection immediately and moves the playhead.
+        self.clear_event_selection()
+        self.selected_pattern_pos = None
+        tick = max(0, min(self.total_ticks() - 1, self.x_to_tick(x)))
+        self.play_tick = tick
+        self.drag_select_start = (x, y)
+        self.status_var.set(
+            f"Playhead: position {tick // 128 + 1}, clock {tick % 128}"
+        )
+        self.draw_timeline()
+
+
+    def canvas_drag_select(self, event):
+        if self.current_song is None:
+            return
+
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+
+        # Existing selected items drag as a group instead of invoking marquee.
+        if self.group_drag is not None:
+            self._move_selected_events(x, y)
+            return
+
+        # Marquee only begins from empty space.
+        if self.drag_select_start is None:
+            return
+
+        x1, y1 = self.drag_select_start
+        if abs(x - x1) < 4 and abs(y - y1) < 4:
+            return
+
+        left, right = sorted((x1, x))
+        top, bottom = sorted((y1, y))
+
+        if self.drag_select_rect is not None:
+            self.canvas.delete(self.drag_select_rect)
+
+        self.drag_select_rect = self.canvas.create_rectangle(
+            left, top, right, bottom,
+            outline="#dddddd", dash=(4, 3), width=1,
+            tags=("selection_box",)
+        )
+
+        selected = set()
+        # Let Tk's native spatial index find visible event graphics in the box.
+        for item in self.canvas.find_overlapping(left, top, right, bottom):
+            for tag in self.canvas.gettags(item):
+                if tag.startswith("ev:"):
+                    try:
+                        idx = int(tag.split(":",1)[1])
+                    except ValueError:
+                        continue
+                    if 0 <= idx < len(self.current_song["events"]):
+                        selected.add(idx)
+
+        self.selected_event_indices = selected
+        if selected:
+            self.select_event(min(selected))
+        else:
+            self.current_event = None
+            self.current_event_index = None
+
+    def canvas_release_select(self, event):
+        if self._finish_group_drag():
+            return
+
+        if self.drag_select_start is None:
+            return
+
+        if self.drag_select_rect is not None:
+            self.canvas.delete(self.drag_select_rect)
+            self.drag_select_rect = None
+
+        self.drag_select_start = None
+        self.draw_timeline()
+
+
+    def select_event(self, idx):
+        if not self.current_song or not (0 <= idx < len(self.current_song["events"])):
+            return
+        e = self.current_song["events"][idx]
+        self.current_event = e
+        self.current_event_index = idx
+        self._loading_event_fields = True
+
+        self.vars["position"].set(str(e.position + 1))
+        self.vars["clock"].set(str(e.raw[1]))
+        self.vars["part"].set(str(e.part + 1))
+        self.vars["note"].set(str(e.note))
+        self.vars["length"].set(str(e.length))
+        self.vars["mask"].set(f"0x{e.mute_mask:04X}")
+        if e.op not in (OP_NOTE,OP_MUTE,OP_TEMPO):
+            self.info.config(text=f"Event #{idx}   {self.automation_lane_label(e.part,e.op)}   value {e.raw[5]}")
+        else:
+            self.info.config(text=f"Event #{idx}   opcode 0x{e.op:04X}")
+        self.status_var.set(f"Selected event #{idx}")
+
+        self._loading_event_fields = False
+
+    def _schedule_event_auto_commit(self, *args):
+        if self._loading_event_fields or self.current_event is None:
+            return
+        if self._auto_commit_after is not None:
+            try:
+                self.after_cancel(self._auto_commit_after)
+            except Exception:
+                pass
+        self._auto_commit_after = self.after(250, self._auto_commit_event_fields)
+
+    def _auto_commit_event_fields(self):
+        self._auto_commit_after = None
+        if self._loading_event_fields or self.current_event is None:
+            return
+
+        e = self.current_event
+        before = bytearray(e.raw)
+        try:
+            pos = int(self.vars["position"].get()) - 1
+            clock = int(self.vars["clock"].get())
+            part = int(self.vars["part"].get()) - 1
+            note = int(self.vars["note"].get())
+            length = int(self.vars["length"].get())
+
+            if not 0 <= pos <= 255:
+                return
+            if not 0 <= clock <= 127:
+                return
+            if not 0 <= part <= 255:
+                return
+            if not 0 <= note <= 255:
+                return
+            if not 0 <= length <= 65535:
+                return
+
+            e.position = pos
+            e.raw[1] = clock
+            e.part = part
+            e.note = note
+            e.length = length
+
+            if e.op == OP_MUTE:
+                txt = self.vars["mask"].get().strip().lower()
+                if txt:
+                    e.mute_mask = int(txt, 16) if txt.startswith("0x") else int(txt)
+
+        except Exception:
+            e.raw[:] = before
+            return
+
+        if e.raw != before:
+            # One undo step for this committed field change.
+            snap = self.snapshot_song()
+            event_snap = snap["events"]
+            if self.current_event_index is not None and 0 <= self.current_event_index < len(event_snap):
+                event_snap[self.current_event_index] = before
+                self.undo_stack.append((self.current_song["index"], snap))
+                if len(self.undo_stack) > 100:
+                    self.undo_stack.pop(0)
+            self.dirty = True
+            self.draw_timeline()
+
+    # ---------- undo ----------
+    def snapshot_song(self):
+        if not self.current_song:
+            return None
+        return {
+            "events": [bytearray(e.raw) for e in self.current_song["events"]],
+            "patterns": list(self.current_song.get("patterns", [])),
+            "length": int(self.current_song.get("length", 0)),
+        }
+
+    def push_undo(self):
+        snap = self.snapshot_song()
+        if snap is not None:
+            self.undo_stack.append((self.current_song["index"], snap))
+            # Keep memory bounded while still allowing substantial editing.
+            if len(self.undo_stack) > 100:
+                self.undo_stack.pop(0)
+
+    def undo(self):
+        if not self.undo_stack or not self.emx:
+            self.status_var.set("Nothing to undo")
+            return
+        song_idx, snap = self.undo_stack.pop()
+        song = self.emx.songs[song_idx]
+        song["events"] = [
+            Event(bytearray(raw), i)
+            for i, raw in enumerate(snap["events"])
+        ]
+        song["patterns"] = list(snap["patterns"])
+        song["length"] = int(snap["length"])
+        self.invalidate_timeline_cache()
+        if self.current_song is song:
+            self.current_event = None
+            self.current_event_index = None
+            self.selected_event_indices.clear()
+            self.selected_pattern_pos = None
+            self.draw_timeline()
+        self.status_var.set(f"Undo • {len(self.undo_stack)} step(s) remaining")
+
+    def delete_selected_events(self):
+        if not self.current_song:
+            return
+
+        indices=set(self.selected_event_indices)
+        if not indices and self.current_event_index is not None:
+            indices={self.current_event_index}
+
+        indices={i for i in indices if 0<=i<len(self.current_song["events"])}
+        if not indices:
+            return
+
+        self.push_undo()
+        self.current_song["events"]=[
+            e for i,e in enumerate(self.current_song["events"]) if i not in indices
+        ]
+        self.invalidate_timeline_cache()
+        self.selected_event_indices.clear()
+        self.current_event=None
+        self.current_event_index=None
+        self.dirty=True
+        self.draw_timeline()
+        self.status_var.set(f"Deleted {len(indices)} event(s)")
+
+
+    def destroy(self):
+        super().destroy()
+
+
+if __name__ == "__main__":
+    App().mainloop()
