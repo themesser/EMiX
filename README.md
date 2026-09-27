@@ -1,5 +1,41 @@
+# EMiX Reborn, a Korg EMX1 manager
+
 <img width="1645" height="911" alt="Screenshot 2026-09-27 at 08 57 12" src="https://github.com/user-attachments/assets/2711e38e-6779-48f2-8b64-92cece6755e7" />
 <img width="1643" height="1110" alt="Screenshot 2026-09-27 at 08 57 43" src="https://github.com/user-attachments/assets/102a2518-a06c-4f00-94dc-703ae2aa83d5" />
+
+# Features
+
+EMiX opens your .EMX dump and also transmit over SYSEX MIDI 
+
+Song Editor
+- Edit EMX song structure
+- Arrange pattern changes on a timeline
+- Edit mute/note/automation events
+- Swap/reorganize tracks and events
+- Preserve pattern-change chains while editing (if you swap a pattern, it will automatically update in the song)
+
+Pattern Editor
+- Open and edit individual EMX patterns
+- Modify parts settings
+- Edit pattern-related parameters
+- Swap patterns
+
+Preset Library
+- Load/Save synth sounds as presets
+- Load/save presets libraries as a shareable .json file 
+
+EMX File Management
+- Work with multiple EMX files
+- Copy/paste songs/patterns between files
+
+MIDI Arrangement Import from DAW
+- Convert repeated regions in the arrangement to a song
+- Convert unique regions to patterns
+
+SysEx Communication with the EMX
+- Send the current song directly to the EMX
+- Send the current pattern directly to the EMX
+
 
 # Installation
 
