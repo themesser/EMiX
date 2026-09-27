@@ -1,4 +1,5 @@
-<img width="2984" height="1702" alt="emix" src="https://github.com/user-attachments/assets/cd7f9846-e219-4b18-ab3f-a27495d99753" />
+<img width="1645" height="911" alt="Screenshot 2026-09-27 at 08 57 12" src="https://github.com/user-attachments/assets/2711e38e-6779-48f2-8b64-92cece6755e7" />
+<img width="1643" height="1110" alt="Screenshot 2026-09-27 at 08 57 43" src="https://github.com/user-attachments/assets/102a2518-a06c-4f00-94dc-703ae2aa83d5" />
 
 # Installation
 
